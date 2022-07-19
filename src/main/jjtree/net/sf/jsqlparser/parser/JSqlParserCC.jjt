@@ -37,6 +37,7 @@ import net.sf.jsqlparser.expression.operators.conditional.*;
 import net.sf.jsqlparser.expression.operators.relational.*;
 import net.sf.jsqlparser.schema.*;
 import net.sf.jsqlparser.statement.*;
+import net.sf.jsqlparser.statement.analyze.*;
 import net.sf.jsqlparser.statement.alter.*;
 import net.sf.jsqlparser.statement.alter.sequence.*;
 import net.sf.jsqlparser.statement.comment.*;
@@ -619,6 +620,8 @@ Statement SingleStatement() :
             stm = AlterSequence()
             |
             stm = Drop()
+            |
+            stm = Analyze()
             |
             stm = Truncate()
             |
@@ -2747,6 +2750,19 @@ GroupByElement GroupByColumnReferences():
     <K_GROUP> <K_BY>
     (     LOOKAHEAD(2) (
               "(" ")" { groupBy.withUsingBrackets(true); }
+              (
+                LOOKAHEAD(2) (
+                  <K_GROUPING> <K_SETS> "("
+                      ( LOOKAHEAD(2) "(" ")" { groupBy.addGroupingSet(new ExpressionList()); }
+                          | LOOKAHEAD(3) "(" list = SimpleExpressionList(true) ")" { groupBy.addGroupingSet(list); }
+                          | expr = SimpleExpression() { groupBy.addGroupingSet(expr); } )
+
+                      ( "," ( LOOKAHEAD(2) "(" ")" { groupBy.addGroupingSet(new ExpressionList()); }
+                          | LOOKAHEAD(3) "(" list = SimpleExpressionList(true) ")" { groupBy.addGroupingSet(list); }
+                          | expr = SimpleExpression() { groupBy.addGroupingSet(expr); } ) )*
+                  ")"
+                )
+              )?
           )
           |
           LOOKAHEAD(2) ( 
@@ -2763,6 +2779,19 @@ GroupByElement GroupByColumnReferences():
           |
           LOOKAHEAD(2) (  
             list = ComplexExpressionList() { groupBy.setGroupByExpressionList(list.withUsingBrackets(false)); }
+            (
+              LOOKAHEAD(2) (
+                <K_GROUPING> <K_SETS> "("
+                    ( LOOKAHEAD(2) "(" ")" { groupBy.addGroupingSet(new ExpressionList()); }
+                        | LOOKAHEAD(3) "(" list = SimpleExpressionList(true) ")" { groupBy.addGroupingSet(list); }
+                        | expr = SimpleExpression() { groupBy.addGroupingSet(expr); } )
+
+                    ( "," ( LOOKAHEAD(2) "(" ")" { groupBy.addGroupingSet(new ExpressionList()); }
+                        | LOOKAHEAD(3) "(" list = SimpleExpressionList(true) ")" { groupBy.addGroupingSet(list); }
+                        | expr = SimpleExpression() { groupBy.addGroupingSet(expr); } ) )*
+                ")"
+              )
+            )?
           )
     )
     {
@@ -5169,6 +5198,21 @@ ColDataType ColDataType():
     }
 }
 
+Analyze Analyze():
+{
+    Analyze analyze = new Analyze();
+    Table table = null;
+}
+{
+    <K_ANALYZE>
+    table=Table()
+
+    {
+    	analyze.setTable(table);
+    	return analyze;
+    }
+}
+
 CreateView CreateView():
 {
     CreateView createView = new CreateView();
@@ -5415,12 +5459,55 @@ List<String> ColumnsNamesList():
     }
 }
 
+String FuncArgsListItem():
+{
+	Token tk = null;
+    String argName = null;
+    String argType = null;
+}
+{
+    (
+        LOOKAHEAD(2) (
+            argName = RelObjectName()
+            argType = RelObjectName()
+            [ "(" tk = <S_LONG>  ")" { argType = argType + "(" + tk.image + ")"; } ]
+        )
+        |
+        (
+            argType = RelObjectName()
+            [ "(" tk = <S_LONG>  ")" { argType = argType + "(" + tk.image + ")"; } ]
+        )
+    )
+	{
+	    return argName != null ? String.format("%s %s", argName, argType) : argType;
+	}
+}
+
+List<String> FuncArgsList():
+{
+    List<String> retval = null;
+    String img = null;
+}
+{
+    "("
+         { retval = new ArrayList<String>(); }
+         [
+            img=FuncArgsListItem() { retval.add(img); }
+            ( "," img=FuncArgsListItem() { retval.add(img); } )*
+         ]
+    ")"
+    {
+        return retval;
+    }
+}
+
 Drop Drop():
 {
     Drop drop = new Drop();
     Token tk = null;
     Table name;
     List<String> dropArgs = new ArrayList<String>();
+    List<String> funcArgs = null;
 }
 {
     <K_DROP>
@@ -5436,17 +5523,25 @@ Drop Drop():
         tk=<K_SCHEMA>
         |
         tk=<K_SEQUENCE>
+        |
+        tk=<K_FUNCTION>
     )
     { drop.setType(tk.image); }
 
     [ LOOKAHEAD(2) <K_IF> <K_EXISTS> {drop.setIfExists(true);} ]
 
     name = Table() { drop.setName(name); }
+    [ funcArgs = FuncArgsList() ]
     ((tk=<S_IDENTIFIER> | tk=<K_CASCADE> | tk=<K_RESTRICT> ) { dropArgs.add(tk.image); })*
 
     {
-        if (dropArgs.size() > 0)
+        if (dropArgs.size() > 0) {
             drop.setParameters(dropArgs);
+        }
+        if (drop.getType().equals("FUNCTION")) {
+            drop.getTypeToParameters().put("FUNCTION", funcArgs);
+        }
+
         return drop;
     }
 }
@@ -5457,7 +5552,15 @@ Truncate Truncate():
     Table table;
 }
 {
-    <K_TRUNCATE> <K_TABLE>
+/**
+* TRUNCATE can be followed directly by the table name in Postgresql
+* See: https://www.postgresql.org/docs/current/sql-truncate.html
+*
+* TRUNCATE [ TABLE ] [ ONLY ] name [ * ] [, ... ]
+*      [ RESTART IDENTITY | CONTINUE IDENTITY ] [ CASCADE | RESTRICT ]
+*
+*/
+    <K_TRUNCATE> [LOOKAHEAD(2) <K_TABLE>  {truncate.setTableToken(true);}] [<K_ONLY>  {truncate.setOnly(true);}]
 	table=Table() { truncate.setTable(table); truncate.setCascade(false); } [ <K_CASCADE> {truncate.setCascade(true);} ]
     {
         return truncate;
@@ -5978,10 +6081,6 @@ AlterSystemStatement AlterSystemStatement():
         |
         ( 
             "DISCONNECT" "SESSION" { operation = AlterSystemOperation.DISCONNECT_SESSION; }
-        )
-        |
-        ( 
-            "DISCONNECT SESSION" { operation = AlterSystemOperation.DISCONNECT_SESSION; }
         )
         |
         ( 
